@@ -1,6 +1,6 @@
-import html
 import time
 from argparse import ArgumentParser
+from contextlib import nullcontext
 from datetime import datetime
 from pathlib import Path
 
@@ -10,178 +10,195 @@ import yaml
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard.writer import SummaryWriter
 
-from countdown_task import CountdownTasksDataset, reward_function
-from grpo import rollout, update_policy
+from grpo import (
+    classification_policy_adapter,
+    rollout_tensor_with_mc_dropout,
+    update_policy,
+)
 from optimizer import MemoryEfficientAdamW
-from qwen2_model import Transformer
-from tokenizer import Tokenizer
+from vision_task import VisionClassificationDataset, classification_reward
+from vit_model import VisionTransformer, VisionTransformerConfig
 
 
-def evaluate(model, tokenizer, device, dtype, config):
-    test_dataset = CountdownTasksDataset(
-        data_path=config["data"]["path"],
-        tokenizer=tokenizer,
-        split="test",
-        test_size=config["data"]["test_size"],
+def build_dataloader(config: dict, split: str) -> DataLoader:
+    data_cfg = config["data"]
+    dataset = VisionClassificationDataset(
+        data_dir=data_cfg[f"{split}_dir"],
+        image_size=data_cfg["image_size"],
+        augment=split == "train" and data_cfg.get("augment", True),
+        mean=data_cfg.get("mean", (0.485, 0.456, 0.406)),
+        std=data_cfg.get("std", (0.229, 0.224, 0.225)),
     )
-    generator = torch.Generator(device=device)
-    # We reduce the batch size by half as we want to
-    # generate twice as long trajectories.
-    dataloader = DataLoader(
-        test_dataset,
-        shuffle=False,
-        collate_fn=CountdownTasksDataset.collate_fn,
-        generator=generator,
-        batch_size=config["training"]["batch_size"] // 2,
-        drop_last=False,
+    loader = DataLoader(
+        dataset,
+        batch_size=config["training"]["batch_size"],
+        shuffle=split == "train",
+        num_workers=data_cfg.get("num_workers", 0),
+        pin_memory=data_cfg.get("pin_memory", False),
+        collate_fn=VisionClassificationDataset.collate_fn,
+        drop_last=split == "train",
     )
-    success = []
-    for batch in dataloader:
-        episodes = rollout(
-            model=model,
-            tokenizer=tokenizer,
-            batch=batch,
-            max_gen_len=config["training"]["max_gen_len"] * 2,
-            num_answer_per_question=1,
-            reward_function=reward_function,
-            device=device,
-            dtype=dtype,
-        )
-        success.extend([episode.reward_info["answer_reward"] for episode in episodes])
-    return np.mean(success)
+    return loader
 
 
-def main(config_path: str):
-    with open(config_path, "r") as f:
-        config = yaml.safe_load(f)
+def autocast_context(device: torch.device, dtype: torch.dtype):
+    if device.type == "cpu":
+        return nullcontext()
+    return torch.autocast(device_type=device.type, dtype=dtype)
 
-    pretrained_model_path = Path(config["model"]["pretrained_model_path"])
-    device = torch.device(config["model"]["device"])
+
+def build_model(config: dict, device: torch.device) -> VisionTransformer:
+    model_cfg = config["model"].copy()
+    model_cfg.pop("device", None)
+    dtype_str = model_cfg.pop("dtype", "float32")
+    checkpoint_path = model_cfg.pop("checkpoint_path", None)
     dtype_map = {
         "bfloat16": torch.bfloat16,
         "float16": torch.float16,
         "float32": torch.float32,
     }
-    dtype = dtype_map.get(config["model"]["dtype"], torch.bfloat16)
-    torch.set_default_device(device)
+    dtype = dtype_map.get(dtype_str, torch.float32)
+    vit_config = VisionTransformerConfig(**model_cfg)
+    model = VisionTransformer(vit_config)
+    model.to(device=device, dtype=dtype)
+    if checkpoint_path:
+        state_dict = torch.load(Path(checkpoint_path), map_location=device)
+        model.load_state_dict(state_dict)
+    return model
+
+
+def evaluate(
+    model: VisionTransformer,
+    dataloader: DataLoader,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> float:
+    was_training = model.training
+    model.eval()
+    correct = 0
+    total = 0
+    for batch in dataloader:
+        inputs = batch.inputs.to(device)
+        targets = batch.targets.to(device)
+        with autocast_context(device, dtype):
+            logits = model(inputs)
+        predictions = logits.argmax(dim=-1)
+        correct += (predictions == targets).sum().item()
+        total += targets.numel()
+    if was_training:
+        model.train()
+    return correct / max(total, 1)
+
+
+def main(config_path: str) -> None:
+    with open(config_path, "r") as handle:
+        config = yaml.safe_load(handle)
+
+    device = torch.device(config["model"].get("device", "cpu"))
+    dtype_str = config["model"].get("dtype", "float32")
+    dtype = {
+        "bfloat16": torch.bfloat16,
+        "float16": torch.float16,
+        "float32": torch.float32,
+    }.get(dtype_str, torch.float32)
     torch.random.manual_seed(config["training"]["random_seed"])
-    BATCH_SIZE = config["training"]["batch_size"]
-    NUM_QUESTIONS_PER_BATCH = config["training"]["num_questions_per_batch"]
-    NUM_ANSWERS_PER_QUESTION = BATCH_SIZE // NUM_QUESTIONS_PER_BATCH
 
-    current_time = datetime.now().strftime(r"%Y%m%d-%H%M%S")
-    tb_writer = SummaryWriter(log_dir=f"{config['training']['log_dir']}/{current_time}")
-    tokenizer = Tokenizer(str(pretrained_model_path / "tokenizer.json"))
+    train_loader = build_dataloader(config, split="train")
+    eval_loader = build_dataloader(config, split="eval")
 
-    train_dataset = CountdownTasksDataset(
-        data_path=config["data"]["path"],
-        tokenizer=tokenizer,
-        split="train",
-        test_size=config["data"]["test_size"],
-    )
-    generator = torch.Generator(device=device)
-    train_dataloader = DataLoader(
-        train_dataset,
-        shuffle=True,
-        collate_fn=CountdownTasksDataset.collate_fn,
-        generator=generator,
-        batch_size=NUM_QUESTIONS_PER_BATCH,
-    )
-
-    model = Transformer.from_pretrained(pretrained_model_path, device=device).train()
-
+    model = build_model(config, device=device)
+    model.train()
     optimizer = MemoryEfficientAdamW(
         model.parameters(),
         lr=config["training"]["learning_rate"],
         weight_decay=config["training"]["weight_decay"],
-        betas=config["training"]["betas"],
-        enabled=config["training"]["memory_efficient_adamw"],
+        betas=tuple(config["training"]["betas"]),
+        enabled=config["training"].get("memory_efficient_adamw", True),
     )
 
     start_time = time.time()
-    ckpt_dir = Path(config["training"]["ckpt_dir"])
+    training_cfg = config["training"]
+    num_mc_samples = training_cfg["num_mc_samples"]
+    num_train_steps = training_cfg["num_train_steps"]
+    current_time = datetime.now().strftime("%Y%m%d-%H%M%S")
+    tb_writer = SummaryWriter(log_dir=f"{training_cfg['log_dir']}/{current_time}")
+    ckpt_dir = Path(training_cfg["ckpt_dir"])
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
-    for step, batch in enumerate(train_dataloader, start=1):
-        episodes = rollout(
+    data_iter = iter(train_loader)
+    for step in range(1, num_train_steps + 1):
+        try:
+            batch = next(data_iter)
+        except StopIteration:
+            data_iter = iter(train_loader)
+            batch = next(data_iter)
+        episodes = rollout_tensor_with_mc_dropout(
             model=model,
-            tokenizer=tokenizer,
             batch=batch,
-            max_gen_len=config["training"]["max_gen_len"],
-            num_answer_per_question=NUM_ANSWERS_PER_QUESTION,
-            reward_function=reward_function,
+            num_samples=num_mc_samples,
+            reward_function=classification_reward,
             device=device,
             dtype=dtype,
         )
-        if config["training"]["skip_unfinished_episodes"]:
-            episodes = [episode for episode in episodes if episode.is_finished]
         results = update_policy(
             model=model,
             optimizer=optimizer,
             episodes=episodes,
-            micro_batch_size=config["training"]["micro_batch_size"],
-            pad_token_id=tokenizer.pad_token_id,
-            max_grad_norm=config["training"]["max_grad_norm"],
+            micro_batch_size=training_cfg["micro_batch_size"],
+            pad_token_id=None,
+            max_grad_norm=training_cfg["max_grad_norm"],
             device=device,
             dtype=dtype,
+            policy_adapter=classification_policy_adapter,
         )
-        torch.cuda.synchronize()
+
+        if device.type == "cuda":
+            torch.cuda.synchronize()
         end_time = time.time()
         duration = end_time - start_time
         start_time = end_time
 
-        # compute and log important metrics
-        reward = [episode.reward for episode in episodes]
-        formatted_reward = [
-            episode.reward_info["format_reward"] for episode in episodes
-        ]
-        answer_reward = [episode.reward_info["answer_reward"] for episode in episodes]
-        num_finished_episodes = sum(episode.is_finished for episode in episodes)
-        mean_reward = np.mean(reward)
-        std_reward = np.std(reward)
-        success_rate = np.mean(answer_reward)
-        format_reward = np.mean(formatted_reward)
+        rewards = np.array([episode.reward for episode in episodes], dtype=np.float32)
+        accuracies = np.array(
+            [episode.reward_info.get("accuracy", 0.0) for episode in episodes],
+            dtype=np.float32,
+        )
+        mean_reward = float(rewards.mean())
+        std_reward = float(rewards.std())
+        mean_accuracy = float(accuracies.mean())
         grad_norm = results["grad_norm"]
         entropy = results["entropy"]
         lr = optimizer.param_groups[0]["lr"]
         loss = results["loss"]
-        mean_response_len = np.mean(
-            [len(episode.generated_token_ids) for episode in episodes]
-        )
+
         print(
-            f"\rStep {step}, mean_reward: {mean_reward:.2f}, "
-            f"train success_rate: {success_rate:.2f}, "
-            f"grad_norm: {grad_norm:.2f}, duration: {duration:.2f}, "
-            f"num_finished_episodes: {num_finished_episodes}, "
-            f"mean_response_len: {mean_response_len:.2f}, "
-            f"entropy: {entropy:.2f}"
+            "\r"
+            f"Step {step}, mean_reward: {mean_reward:.3f}, accuracy: {mean_accuracy:.3f}, "
+            f"grad_norm: {grad_norm:.3f}, loss: {loss:.4f}, duration: {duration:.2f}s",
+            end="",
+            flush=True,
         )
-        if step % config["training"]["eval_interval"] == 0:
-            eval_success_rate = evaluate(model, tokenizer, device, dtype, config)
-            print(f"\rEval success rate: {eval_success_rate:.2f}" + " " * 100)
-            tb_writer.add_scalar("success_rate/eval", eval_success_rate, step)
+
+        if step % training_cfg["eval_interval"] == 0:
+            eval_accuracy = evaluate(model, eval_loader, device=device, dtype=dtype)
+            print(f"\rEval accuracy: {eval_accuracy:.3f}" + " " * 80)
+            tb_writer.add_scalar("accuracy/eval", eval_accuracy, step)
 
         tb_writer.add_scalar("loss", loss, step)
-        tb_writer.add_scalar("mean_reward", mean_reward, step)
-        tb_writer.add_scalar("std_reward", std_reward, step)
-        tb_writer.add_scalar("success_rate/train", success_rate, step)
-        tb_writer.add_scalar("format_reward", format_reward, step)
+        tb_writer.add_scalar("reward/mean", mean_reward, step)
+        tb_writer.add_scalar("reward/std", std_reward, step)
+        tb_writer.add_scalar("accuracy/train", mean_accuracy, step)
         tb_writer.add_scalar("grad_norm", grad_norm, step)
-        tb_writer.add_scalar("duration", duration, step)
-        tb_writer.add_scalar("num_finished_episodes", num_finished_episodes, step)
-        tb_writer.add_scalar("learning_rate", lr, step)
-        tb_writer.add_scalar("mean_response_len", mean_response_len, step)
         tb_writer.add_scalar("entropy", entropy, step)
-        for i, episode in enumerate(episodes):
-            # TensorBoard treats text as markdown.
-            text = html.escape(episode.text)
-            tb_writer.add_text(f"text_{i}", f"<pre>{text}</pre>", step)
+        tb_writer.add_scalar("learning_rate", lr, step)
+        tb_writer.add_scalar("iteration_duration", duration, step)
 
-        # save checkpoint
-        if step % config["training"]["ckpt_save_interval"] == 0:
-            output_file = ckpt_dir / f"ckpt_{step:06d}.pt"
-            torch.save(model.state_dict(), output_file)
-            print(f"Saved checkpoint to {output_file}")
+        if step % training_cfg["ckpt_save_interval"] == 0:
+            ckpt_path = ckpt_dir / f"ckpt_{step:06d}.pt"
+            torch.save(model.state_dict(), ckpt_path)
+            print(f"\nSaved checkpoint to {ckpt_path}")
+
+    tb_writer.close()
 
 
 if __name__ == "__main__":
@@ -189,3 +206,4 @@ if __name__ == "__main__":
     parser.add_argument("--config", type=str, default="config.yaml")
     args = parser.parse_args()
     main(args.config)
+
